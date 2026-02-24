@@ -1,0 +1,90 @@
+{
+  "name": "wt-color",
+  "displayName": "Worktree Color",
+  "description": "Deterministically colors the VS Code title bar based on the current git branch, making it easy to distinguish between worktree windows.",
+  "version": "0.1.0",
+  "publisher": "ghmeier",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "wt-color.refresh",
+        "title": "Worktree Color: Refresh"
+      },
+      {
+        "command": "wt-color.showBranch",
+        "title": "Worktree Color: Show"
+      }
+    ],
+    "configuration": {
+      "title": "Worktree Color",
+      "properties": {
+        "wtColor.palette": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Custom color palette (hex codes) for title bars. Leave empty to use the built-in Monokai Pro-inspired palette. Example: `[\"#2d1b36\", \"#1b2d36\", \"#2d361b\"]`"
+        },
+        "wtColor.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable automatic title bar coloring."
+        },
+        "wtColor.colorTitleBarText": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically set a readable foreground (text) color for the title bar."
+        },
+        "wtColor.areas": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "titleBar",
+              "activityBar",
+              "statusBar",
+              "sideBar",
+              "tab",
+              "panel",
+              "border"
+            ]
+          },
+          "default": [
+            "titleBar",
+            "activityBar",
+            "statusBar"
+          ],
+          "markdownDescription": "Which UI areas to color. Pick any combination of:\n- `titleBar` — top title bar\n- `activityBar` — icon sidebar on the far left/right\n- `statusBar` — bottom status bar\n- `sideBar` — file explorer / sidebar background\n- `tab` — editor tab bar background\n- `panel` — bottom panel (terminal, output, etc.)\n- `border` — adds a colored border between major sections"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --allow-missing-repository",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "format": "biome format src/",
+    "format:fix": "biome format --write src/",
+    "ci": "biome ci src/"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.4",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.3.0"
+  }
+}
