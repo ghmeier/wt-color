@@ -1,6 +1,9 @@
-import { execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import * as vscode from "vscode";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Built-in palette: muted, dark background colors inspired by Monokai Pro's
@@ -31,15 +34,19 @@ type Area =
   | "panel"
   | "border";
 
+interface AreaMapping {
+  bg: string[];
+  bgDim: string[];
+  fg: string[];
+  fgDim: string[];
+}
+
 /**
  * Maps each UI area to the colorCustomization keys it controls.
  * "bg" keys get the branch color, "fg" keys get the readable foreground,
  * "bgDim" keys get the dimmed (inactive) variant.
  */
-const AREA_KEYS: Record<
-  Area,
-  { bg: string[]; bgDim: string[]; fg: string[]; fgDim: string[] }
-> = {
+const AREA_KEYS: Record<Area, AreaMapping> = {
   titleBar: {
     bg: ["titleBar.activeBackground"],
     bgDim: ["titleBar.inactiveBackground"],
@@ -133,7 +140,6 @@ const AREA_KEYS: Record<
   },
 };
 
-/** All colorCustomization keys we might write, used for cleanup. */
 const ALL_MANAGED_KEYS = new Set(
   Object.values(AREA_KEYS).flatMap((v) => [
     ...v.bg,
@@ -143,20 +149,35 @@ const ALL_MANAGED_KEYS = new Set(
   ])
 );
 
-export function activate(context: vscode.ExtensionContext) {
-  // Apply color on startup.
+const state = {
+  isSecondaryWorktree: false,
+  lastAppliedBranch: undefined as string | undefined,
+  lastAppliedAreas: undefined as string | undefined,
+  // biome-ignore lint/suspicious/noExplicitAny: VS Code git extension API is untyped
+  gitApi: undefined as any,
+};
+
+export async function activate(context: vscode.ExtensionContext) {
+  state.gitApi = resolveGitApi();
+
+  state.isSecondaryWorktree = await computeIsSecondaryWorktree();
+
   applyBranchColor();
 
   // Re-apply when the user switches branches (fires on HEAD change).
-  const gitExt = vscode.extensions.getExtension("vscode.git");
-  if (gitExt) {
-    const gitApi = gitExt.exports?.getAPI(1);
-    if (gitApi) {
-      // When repositories change or HEAD moves, re-evaluate.
-      gitApi.onDidOpenRepository(() => applyBranchColor());
-      for (const repo of gitApi.repositories) {
-        repo.state.onDidChange(() => applyBranchColor());
-      }
+  if (state.gitApi) {
+    context.subscriptions.push(
+      state.gitApi.onDidOpenRepository((repo: GitRepository) => {
+        context.subscriptions.push(
+          repo.state.onDidChange(() => applyBranchColor())
+        );
+        applyBranchColor();
+      })
+    );
+    for (const repo of state.gitApi.repositories) {
+      context.subscriptions.push(
+        repo.state.onDidChange(() => applyBranchColor())
+      );
     }
   }
 
@@ -169,7 +190,7 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Register commands.
+  // Register command pallette commands
   context.subscriptions.push(
     vscode.commands.registerCommand("wt-color.refresh", () => {
       applyBranchColor();
@@ -183,7 +204,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (branch) {
         const color = pickColor(branch);
         vscode.window.showInformationMessage(
-          `Branch: ${branch}  →  Title bar: ${color}`
+          `Branch: ${branch}  →  Color: ${color}`
         );
       } else {
         vscode.window.showWarningMessage(
@@ -196,21 +217,13 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
-// ---------------------------------------------------------------------------
-// Core logic
-// ---------------------------------------------------------------------------
-
-let lastAppliedBranch: string | undefined;
-let lastAppliedAreas: string | undefined;
-
 function applyBranchColor() {
   const config = vscode.workspace.getConfiguration("wtColor");
   if (!config.get<boolean>("enabled", true)) {
     return;
   }
 
-  // Don't color the main worktree — only color secondary worktrees.
-  if (!isSecondaryWorktree()) {
+  if (!state.isSecondaryWorktree) {
     clearManagedColors();
     return;
   }
@@ -225,14 +238,17 @@ function applyBranchColor() {
     "activityBar",
     "statusBar",
   ]);
-  const areasKey = areas.sort().join(",");
+  const areasKey = [...areas].sort().join(",");
 
   // Avoid redundant writes when nothing has changed.
-  if (branch === lastAppliedBranch && areasKey === lastAppliedAreas) {
+  if (
+    branch === state.lastAppliedBranch &&
+    areasKey === state.lastAppliedAreas
+  ) {
     return;
   }
-  lastAppliedBranch = branch;
-  lastAppliedAreas = areasKey;
+  state.lastAppliedBranch = branch;
+  state.lastAppliedAreas = areasKey;
 
   const bg = pickColor(branch);
   const autoFg = config.get<boolean>("colorTitleBarText", true);
@@ -240,83 +256,60 @@ function applyBranchColor() {
   const fgDim = fg ? adjustAlpha(fg, 0.6) : undefined;
   const bgDim = adjustAlpha(bg, 0.6);
 
-  const workbench = vscode.workspace.getConfiguration("workbench");
-  const existing =
-    workbench.get<Record<string, string>>("colorCustomizations") ?? {};
+  const colors = buildColorMap(areas, { bg, bgDim, fg, fgDim });
+  updateColorCustomizations(colors);
+}
 
-  // Start fresh: copy existing settings but remove all keys we manage,
-  // then add back only the ones for currently-enabled areas.
-  const updated: Record<string, string> = {};
-  for (const [key, value] of Object.entries(existing)) {
-    if (!ALL_MANAGED_KEYS.has(key)) {
-      updated[key] = value;
-    }
-  }
-
+/**
+ * Build a map of VS Code color keys from the selected areas and colors.
+ */
+function buildColorMap(
+  areas: Area[],
+  colors: { bg: string; bgDim: string; fg?: string; fgDim?: string }
+): Record<string, string> {
+  const result: Record<string, string> = {};
   for (const area of areas) {
     const mapping = AREA_KEYS[area];
     if (!mapping) {
       continue;
     }
     for (const key of mapping.bg) {
-      updated[key] = bg;
+      result[key] = colors.bg;
     }
     for (const key of mapping.bgDim) {
-      updated[key] = bgDim;
+      result[key] = colors.bgDim;
     }
-    if (fg) {
+    if (colors.fg) {
       for (const key of mapping.fg) {
-        updated[key] = fg;
+        result[key] = colors.fg;
       }
     }
-    if (fgDim) {
+    if (colors.fgDim) {
       for (const key of mapping.fgDim) {
-        updated[key] = fgDim;
+        result[key] = colors.fgDim;
       }
     }
   }
+  return result;
+}
+
+/**
+ * Merge new color keys into workbench.colorCustomizations, replacing any
+ * previously managed keys while preserving user-defined ones.
+ */
+function updateColorCustomizations(newColors: Record<string, string>) {
+  const workbench = vscode.workspace.getConfiguration("workbench");
+  const existing =
+    workbench.get<Record<string, string>>("colorCustomizations") ?? {};
+
+  const updated = stripManagedKeys(existing);
+  Object.assign(updated, newColors);
 
   workbench.update(
     "colorCustomizations",
     updated,
     vscode.ConfigurationTarget.Workspace
   );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Returns true if the current workspace is a secondary git worktree
- * (not the main/root worktree). Compares --git-dir to --git-common-dir:
- * in the main worktree they resolve to the same path, in a linked
- * worktree --git-dir points to .git/worktrees/<name>.
- */
-function isSecondaryWorktree(): boolean {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) {
-    return false;
-  }
-  try {
-    const cwd = folders[0].uri.fsPath;
-    const gitDir = execSync("git rev-parse --git-dir", {
-      cwd,
-      encoding: "utf-8",
-      timeout: 3000,
-    }).trim();
-    const gitCommonDir = execSync("git rev-parse --git-common-dir", {
-      cwd,
-      encoding: "utf-8",
-      timeout: 3000,
-    }).trim();
-    // Resolve to absolute paths for a reliable comparison.
-    const abs = (p: string) =>
-      path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
-    return abs(gitDir) !== abs(gitCommonDir);
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -328,37 +321,85 @@ function clearManagedColors() {
   const existing =
     workbench.get<Record<string, string>>("colorCustomizations") ?? {};
 
-  let changed = false;
-  const updated: Record<string, string> = {};
-  for (const [key, value] of Object.entries(existing)) {
-    if (ALL_MANAGED_KEYS.has(key)) {
-      changed = true;
-    } else {
-      updated[key] = value;
-    }
+  const updated = stripManagedKeys(existing);
+  if (Object.keys(updated).length === Object.keys(existing).length) {
+    return;
   }
 
-  if (changed) {
-    lastAppliedBranch = undefined;
-    lastAppliedAreas = undefined;
-    workbench.update(
-      "colorCustomizations",
-      Object.keys(updated).length > 0 ? updated : undefined,
-      vscode.ConfigurationTarget.Workspace
-    );
+  state.lastAppliedBranch = undefined;
+  state.lastAppliedAreas = undefined;
+  workbench.update(
+    "colorCustomizations",
+    Object.keys(updated).length > 0 ? updated : undefined,
+    vscode.ConfigurationTarget.Workspace
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+interface GitRepository {
+  state: {
+    HEAD?: { name?: string };
+    onDidChange: (cb: () => void) => vscode.Disposable;
+  };
+}
+
+function resolveGitApi() {
+  const gitExt = vscode.extensions.getExtension("vscode.git");
+  return gitExt?.exports?.getAPI(1) ?? null;
+}
+
+/**
+ * Computes whether the current workspace is a secondary git worktree
+ * (not the main/root worktree). Compares --git-dir to --git-common-dir:
+ * in the main worktree they resolve to the same path, in a linked
+ * worktree --git-dir points to .git/worktrees/<name>.
+ *
+ * Runs both git calls in parallel. Called once at activation and cached
+ * for the session lifetime.
+ */
+async function computeIsSecondaryWorktree(): Promise<boolean> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    return false;
+  }
+  try {
+    const cwd = folders[0].uri.fsPath;
+    const opts = { cwd, timeout: 3000 };
+    const [gitDirResult, gitCommonDirResult] = await Promise.all([
+      execFileAsync("git", ["rev-parse", "--git-dir"], opts),
+      execFileAsync("git", ["rev-parse", "--git-common-dir"], opts),
+    ]);
+    const gitDir = gitDirResult.stdout.trim();
+    const gitCommonDir = gitCommonDirResult.stdout.trim();
+    const abs = (p: string) =>
+      path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
+    return abs(gitDir) !== abs(gitCommonDir);
+  } catch {
+    return false;
   }
 }
 
+/** Return a copy of `colors` with all extension-managed keys removed. */
+function stripManagedKeys(
+  colors: Record<string, string>
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(colors)) {
+    if (!ALL_MANAGED_KEYS.has(key)) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 function getCurrentBranch(): string | undefined {
-  // Prefer the VS Code git extension API.
-  const gitExt = vscode.extensions.getExtension("vscode.git");
-  if (gitExt) {
-    const gitApi = gitExt.exports?.getAPI(1);
-    if (gitApi && gitApi.repositories.length > 0) {
-      const head = gitApi.repositories[0].state.HEAD;
-      if (head?.name) {
-        return head.name;
-      }
+  if (state.gitApi && state.gitApi.repositories.length > 0) {
+    const head = state.gitApi.repositories[0].state.HEAD;
+    if (head?.name) {
+      return head.name;
     }
   }
 
