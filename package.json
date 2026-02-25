@@ -14,6 +14,7 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "extensionDependencies": ["vscode.git"],
   "contributes": {
     "commands": [
       {
@@ -40,11 +41,6 @@
           "type": "boolean",
           "default": true,
           "description": "Enable or disable automatic title bar coloring."
-        },
-        "wtColor.colorTitleBarText": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically set a readable foreground (text) color for the title bar."
         },
         "wtColor.areas": {
           "type": "array",

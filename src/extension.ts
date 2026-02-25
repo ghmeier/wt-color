@@ -1,9 +1,5 @@
-import { execFile, execSync } from "node:child_process";
-import * as path from "node:path";
-import { promisify } from "node:util";
 import * as vscode from "vscode";
-
-const execFileAsync = promisify(execFile);
+import type { API, GitExtension, Repository } from "./git";
 
 /**
  * Built-in palette: muted, dark background colors inspired by Monokai Pro's
@@ -36,6 +32,7 @@ type Area =
 
 interface AreaMapping {
   bg: string[];
+  bgBright: string[];
   bgDim: string[];
   fg: string[];
   fgDim: string[];
@@ -49,6 +46,7 @@ interface AreaMapping {
 const AREA_KEYS: Record<Area, AreaMapping> = {
   titleBar: {
     bg: ["titleBar.activeBackground"],
+    bgBright: [],
     bgDim: ["titleBar.inactiveBackground"],
     fg: ["titleBar.activeForeground"],
     fgDim: ["titleBar.inactiveForeground"],
@@ -59,6 +57,7 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
       // When activity bar is positioned at the top of the sidebar:
       "activityBarTop.background",
     ],
+    bgBright: [],
     bgDim: [],
     fg: ["activityBar.foreground", "activityBarTop.foreground"],
     fgDim: [
@@ -73,6 +72,7 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
       "statusBar.noFolderBackground",
       "statusBarItem.remoteBackground",
     ],
+    bgBright: [],
     bgDim: [],
     fg: [
       "statusBar.foreground",
@@ -89,6 +89,7 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
       "sideBarTitle.background",
       "sideBarStickyScroll.background",
     ],
+    bgBright: [],
     bgDim: [],
     fg: [
       "sideBar.foreground",
@@ -106,6 +107,7 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
       "tab.unfocusedInactiveBackground",
       "breadcrumb.background",
     ],
+    bgBright: ["tab.hoverBackground", "tab.unfocusedHoverBackground"],
     bgDim: [],
     fg: ["tab.activeForeground", "breadcrumb.foreground"],
     fgDim: [
@@ -121,12 +123,14 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
       "panelSectionHeader.background",
       "panelStickyScroll.background",
     ],
+    bgBright: [],
     bgDim: [],
     fg: ["panelTitle.activeForeground", "panelSectionHeader.foreground"],
     fgDim: ["panelTitle.inactiveForeground"],
   },
   border: {
-    bg: [
+    bg: [],
+    bgBright: [
       "activityBar.border",
       "sideBar.border",
       "panel.border",
@@ -143,6 +147,7 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
 const ALL_MANAGED_KEYS = new Set(
   Object.values(AREA_KEYS).flatMap((v) => [
     ...v.bg,
+    ...v.bgBright,
     ...v.bgDim,
     ...v.fg,
     ...v.fgDim,
@@ -150,61 +155,59 @@ const ALL_MANAGED_KEYS = new Set(
 );
 
 const state = {
-  isSecondaryWorktree: false,
-  lastAppliedBranch: undefined as string | undefined,
-  lastAppliedAreas: undefined as string | undefined,
-  // biome-ignore lint/suspicious/noExplicitAny: VS Code git extension API is untyped
-  gitApi: undefined as any,
+  initialized: false,
+  colors: [] as Record<string, string>[],
+  gitApi: undefined as API | undefined,
 };
 
 export async function activate(context: vscode.ExtensionContext) {
   state.gitApi = resolveGitApi();
-
-  state.isSecondaryWorktree = await computeIsSecondaryWorktree();
-
-  applyBranchColor();
+  // The git extension is required.
+  if (!state.gitApi) {
+    return;
+  }
 
   // Re-apply when the user switches branches (fires on HEAD change).
-  if (state.gitApi) {
-    context.subscriptions.push(
-      state.gitApi.onDidOpenRepository((repo: GitRepository) => {
-        context.subscriptions.push(
-          repo.state.onDidChange(() => applyBranchColor())
-        );
-        applyBranchColor();
-      })
-    );
-    for (const repo of state.gitApi.repositories) {
+  context.subscriptions.push(
+    state.gitApi.onDidOpenRepository((repo) => {
       context.subscriptions.push(
-        repo.state.onDidChange(() => applyBranchColor())
+        repo.state.onDidChange(() => applyBranchColor(repo))
       );
-    }
-  }
+      applyBranchColor(repo);
+    })
+  );
 
   // Also watch for config changes so the user can live-edit the palette.
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("wtColor")) {
-        applyBranchColor();
+      const repo = state.gitApi?.repositories?.[0];
+      if (!repo || !e.affectsConfiguration("wtColor")) {
+        return;
       }
+      state.initialized = false;
+      applyBranchColor(repo);
     })
   );
 
   // Register command pallette commands
   context.subscriptions.push(
     vscode.commands.registerCommand("wt-color.refresh", () => {
-      applyBranchColor();
-      vscode.window.showInformationMessage("Worktree Color: refreshed.");
+      const repo = state.gitApi?.repositories?.[0];
+      if (!repo) {
+        return;
+      }
+      state.initialized = false;
+      applyBranchColor(repo);
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("wt-color.showBranch", () => {
-      const branch = getCurrentBranch();
+      const branch = state.gitApi?.repositories?.[0]?.state.HEAD?.name;
       if (branch) {
-        const color = pickColor(branch);
+        const ix = pickIndex(branch);
         vscode.window.showInformationMessage(
-          `Branch: ${branch}  →  Color: ${color}`
+          `Worktree Color: branch=${branch}, color=${state.colors[ix].bg}`
         );
       } else {
         vscode.window.showWarningMessage(
@@ -217,19 +220,48 @@ export async function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
-function applyBranchColor() {
-  const config = vscode.workspace.getConfiguration("wtColor");
-  if (!config.get<boolean>("enabled", true)) {
+function applyBranchColor(repository: Repository) {
+  initializeColors();
+
+  if (!repository || repository.kind !== "worktree") {
     return;
   }
 
-  if (!state.isSecondaryWorktree) {
-    clearManagedColors();
-    return;
-  }
-
-  const branch = getCurrentBranch();
+  const branch = repository.state.HEAD?.name;
   if (!branch) {
+    return;
+  }
+
+  const ix = pickIndex(branch);
+  if (!state.colors[ix]) {
+    return;
+  }
+
+  const workbench = vscode.workspace.getConfiguration("workbench");
+  const existing =
+    workbench.get<Record<string, string>>("colorCustomizations") ?? {};
+
+  // Merge other colors with extension-managed colors to apply them.
+  const updated = stripManagedKeys(existing);
+  Object.assign(updated, state.colors[ix]);
+
+  workbench.update(
+    "colorCustomizations",
+    updated,
+    vscode.ConfigurationTarget.Workspace
+  );
+}
+
+function initializeColors() {
+  if (state.initialized) {
+    return;
+  }
+
+  const config = vscode.workspace.getConfiguration("wtColor");
+  state.initialized = true;
+
+  if (!config.get<boolean>("enabled", true)) {
+    state.colors = [];
     return;
   }
 
@@ -238,26 +270,18 @@ function applyBranchColor() {
     "activityBar",
     "statusBar",
   ]);
-  const areasKey = [...areas].sort().join(",");
-
-  // Avoid redundant writes when nothing has changed.
-  if (
-    branch === state.lastAppliedBranch &&
-    areasKey === state.lastAppliedAreas
-  ) {
-    return;
+  let palette = config.get<string[]>("palette", []);
+  if (!palette.length) {
+    palette = DEFAULT_PALETTE;
   }
-  state.lastAppliedBranch = branch;
-  state.lastAppliedAreas = areasKey;
 
-  const bg = pickColor(branch);
-  const autoFg = config.get<boolean>("colorTitleBarText", true);
-  const fg = autoFg ? readableForeground(bg) : undefined;
-  const fgDim = fg ? adjustAlpha(fg, 0.6) : undefined;
-  const bgDim = adjustAlpha(bg, 0.6);
-
-  const colors = buildColorMap(areas, { bg, bgDim, fg, fgDim });
-  updateColorCustomizations(colors);
+  for (const bg of palette) {
+    const fg = readableForeground(bg);
+    const fgDim = adjustAlpha(fg, 0.6);
+    const bgDim = adjustAlpha(bg, 0.6);
+    const bgBright = lighten(bg, 0.1);
+    state.colors.push(buildColorMap(areas, { bg, bgBright, bgDim, fg, fgDim }));
+  }
 }
 
 /**
@@ -265,7 +289,13 @@ function applyBranchColor() {
  */
 function buildColorMap(
   areas: Area[],
-  colors: { bg: string; bgDim: string; fg?: string; fgDim?: string }
+  colors: {
+    bg: string;
+    bgBright: string;
+    bgDim: string;
+    fg: string;
+    fgDim: string;
+  }
 ): Record<string, string> {
   const result: Record<string, string> = {};
   for (const area of areas) {
@@ -276,110 +306,27 @@ function buildColorMap(
     for (const key of mapping.bg) {
       result[key] = colors.bg;
     }
+    for (const key of mapping.bgBright) {
+      result[key] = colors.bgBright;
+    }
     for (const key of mapping.bgDim) {
       result[key] = colors.bgDim;
     }
-    if (colors.fg) {
-      for (const key of mapping.fg) {
-        result[key] = colors.fg;
-      }
+    for (const key of mapping.fg) {
+      result[key] = colors.fg;
     }
-    if (colors.fgDim) {
-      for (const key of mapping.fgDim) {
-        result[key] = colors.fgDim;
-      }
+    for (const key of mapping.fgDim) {
+      result[key] = colors.fgDim;
     }
   }
+
   return result;
 }
 
-/**
- * Merge new color keys into workbench.colorCustomizations, replacing any
- * previously managed keys while preserving user-defined ones.
- */
-function updateColorCustomizations(newColors: Record<string, string>) {
-  const workbench = vscode.workspace.getConfiguration("workbench");
-  const existing =
-    workbench.get<Record<string, string>>("colorCustomizations") ?? {};
-
-  const updated = stripManagedKeys(existing);
-  Object.assign(updated, newColors);
-
-  workbench.update(
-    "colorCustomizations",
-    updated,
-    vscode.ConfigurationTarget.Workspace
-  );
-}
-
-/**
- * Remove all color keys managed by this extension from workspace settings.
- * Called when we're in the main worktree so it stays at default colors.
- */
-function clearManagedColors() {
-  const workbench = vscode.workspace.getConfiguration("workbench");
-  const existing =
-    workbench.get<Record<string, string>>("colorCustomizations") ?? {};
-
-  const updated = stripManagedKeys(existing);
-  if (Object.keys(updated).length === Object.keys(existing).length) {
-    return;
-  }
-
-  state.lastAppliedBranch = undefined;
-  state.lastAppliedAreas = undefined;
-  workbench.update(
-    "colorCustomizations",
-    Object.keys(updated).length > 0 ? updated : undefined,
-    vscode.ConfigurationTarget.Workspace
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-interface GitRepository {
-  state: {
-    HEAD?: { name?: string };
-    onDidChange: (cb: () => void) => vscode.Disposable;
-  };
-}
-
 function resolveGitApi() {
-  const gitExt = vscode.extensions.getExtension("vscode.git");
-  return gitExt?.exports?.getAPI(1) ?? null;
-}
-
-/**
- * Computes whether the current workspace is a secondary git worktree
- * (not the main/root worktree). Compares --git-dir to --git-common-dir:
- * in the main worktree they resolve to the same path, in a linked
- * worktree --git-dir points to .git/worktrees/<name>.
- *
- * Runs both git calls in parallel. Called once at activation and cached
- * for the session lifetime.
- */
-async function computeIsSecondaryWorktree(): Promise<boolean> {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) {
-    return false;
-  }
-  try {
-    const cwd = folders[0].uri.fsPath;
-    const opts = { cwd, timeout: 3000 };
-    const [gitDirResult, gitCommonDirResult] = await Promise.all([
-      execFileAsync("git", ["rev-parse", "--git-dir"], opts),
-      execFileAsync("git", ["rev-parse", "--git-common-dir"], opts),
-    ]);
-    const gitDir = gitDirResult.stdout.trim();
-    const gitCommonDir = gitCommonDirResult.stdout.trim();
-    const abs = (p: string) =>
-      path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
-    return abs(gitDir) !== abs(gitCommonDir);
-  } catch {
-    return false;
-  }
+  const gitExtension =
+    vscode.extensions.getExtension<GitExtension>("vscode.git")?.exports;
+  return gitExtension?.getAPI(1);
 }
 
 /** Return a copy of `colors` with all extension-managed keys removed. */
@@ -395,49 +342,18 @@ function stripManagedKeys(
   return result;
 }
 
-function getCurrentBranch(): string | undefined {
-  if (state.gitApi && state.gitApi.repositories.length > 0) {
-    const head = state.gitApi.repositories[0].state.HEAD;
-    if (head?.name) {
-      return head.name;
-    }
-  }
-
-  // Fallback: shell out.
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) {
-    return undefined;
-  }
-  try {
-    const cwd = folders[0].uri.fsPath;
-    return execSync("git rev-parse --abbrev-ref HEAD", {
-      cwd,
-      encoding: "utf-8",
-      timeout: 3000,
-    }).trim();
-  } catch {
-    return undefined;
-  }
-}
-
-function getPalette(): string[] {
-  const config = vscode.workspace.getConfiguration("wtColor");
-  const custom = config.get<string[]>("palette", []);
-  return custom.length > 0 ? custom : DEFAULT_PALETTE;
-}
-
 /**
- * Simple string hash (djb2) mapped to a palette index.
- * Deterministic: the same branch name always yields the same color.
+ * Return an index into a list of `size` items.
+ * - "hash": djb2 hash of the branch name (deterministic per branch name).
+ * - "index": the worktree's position in `git worktree list` (sequential rotation).
  */
-function pickColor(branch: string): string {
-  const palette = getPalette();
+function pickIndex(branch: string): number {
   let hash = 5381;
   for (let i = 0; i < branch.length; i++) {
     hash = (hash * 33) ^ branch.charCodeAt(i);
   }
-  const index = Math.abs(hash) % palette.length;
-  return palette[index];
+
+  return Math.abs(hash) % state.colors.length;
 }
 
 /**
@@ -450,6 +366,20 @@ function readableForeground(hex: string): string {
   // Relative luminance approximation.
   const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
   return luminance > 140 ? "#1a1a1a" : "#f8f8f2";
+}
+
+/**
+ * Lighten a hex color by mixing it toward white by `amount` (0-1).
+ * Used to make borders and hover states visibly brighter than the base color.
+ */
+function lighten(hex: string, amount: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  const lr = Math.round(r + (255 - r) * amount);
+  const lg = Math.round(g + (255 - g) * amount);
+  const lb = Math.round(b + (255 - b) * amount);
+  return `#${lr.toString(16).padStart(2, "0")}${lg.toString(16).padStart(2, "0")}${lb.toString(16).padStart(2, "0")}`;
 }
 
 /**
