@@ -222,18 +222,24 @@ export function deactivate() {}
 
 function applyBranchColor(repository: Repository) {
   initializeColors();
+  const isOpenFolder = vscode.workspace.workspaceFolders?.some(
+    (f) => f.uri.fsPath === repository.rootUri.fsPath
+  );
 
-  if (!repository || repository.kind !== "worktree") {
+  if (!repository || repository.kind !== "worktree" || !isOpenFolder) {
+    clearColors();
     return;
   }
 
   const branch = repository.state.HEAD?.name;
   if (!branch) {
+    clearColors();
     return;
   }
 
   const ix = pickIndex(branch);
   if (!state.colors[ix]) {
+    clearColors();
     return;
   }
 
@@ -247,7 +253,23 @@ function applyBranchColor(repository: Repository) {
 
   workbench.update(
     "colorCustomizations",
-    updated,
+    { ...existing, ...state.colors[ix] },
+    vscode.ConfigurationTarget.Workspace
+  );
+}
+
+function clearColors() {
+  const workbench = vscode.workspace.getConfiguration("workbench");
+  const existing =
+    workbench.get<Record<string, string>>("colorCustomizations") ?? {};
+  const updated = stripManagedKeys(existing);
+  if (Object.keys(updated).length === Object.keys(existing).length) {
+    return;
+  }
+
+  workbench.update(
+    "colorCustomizations",
+    Object.keys(updated).length > 0 ? updated : undefined,
     vscode.ConfigurationTarget.Workspace
   );
 }
