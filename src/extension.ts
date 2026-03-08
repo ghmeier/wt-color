@@ -203,11 +203,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("wt-color.showBranch", () => {
-      const branch = state.gitApi?.repositories?.[0]?.state.HEAD?.name;
+      const repo = state.gitApi?.repositories?.[0];
+      const branch = repo?.state.HEAD?.name;
+
       if (branch) {
         const ix = pickIndex(branch);
         vscode.window.showInformationMessage(
-          `Worktree Color: branch=${branch}, color=${state.colors[ix].bg}`
+          `Worktree Color: branch=${branch}, color=${state.colors[ix]?.bg ?? "default"}`
         );
       } else {
         vscode.window.showWarningMessage(
