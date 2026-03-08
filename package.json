@@ -14,7 +14,9 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
-  "extensionDependencies": ["vscode.git"],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
   "contributes": {
     "commands": [
       {
@@ -70,17 +72,25 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "npx @vscode/vsce package --allow-missing-repository",
+    "build": "npm run compile && npm run package",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format src/",
     "format:fix": "biome format --write src/",
-    "ci": "biome ci src/"
+    "ci": "biome ci src/",
+    "pretest": "tsc -p ./",
+    "test": "node out/test/runTest.js"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.0.0",
+    "glob": "^13.0.6",
+    "mocha": "^11.7.5",
     "typescript": "^5.3.0"
   }
 }

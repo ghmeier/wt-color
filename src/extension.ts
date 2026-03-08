@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import type { API, GitExtension, Repository } from "./git";
 
+let log: vscode.LogOutputChannel;
+
 /**
  * Built-in palette: muted, dark background colors inspired by Monokai Pro's
  * accent hues. Each is dark enough to serve as a title bar background while
@@ -158,23 +160,49 @@ const state = {
   initialized: false,
   colors: [] as Record<string, string>[],
   gitApi: undefined as API | undefined,
+  appliedBranch: undefined as string | undefined,
 };
 
 export async function activate(context: vscode.ExtensionContext) {
+  log = vscode.window.createOutputChannel("Worktree Color", { log: true });
+  context.subscriptions.push(log);
+  log.info("Activating wt-color extension");
+
   state.gitApi = resolveGitApi();
   // The git extension is required.
   if (!state.gitApi) {
+    log.warn("Git extension not found — deactivating");
     return;
   }
+  log.info("Git API resolved");
 
-  // Re-apply when the user switches branches (fires on HEAD change).
+  // Subscribe to state changes for a repository with debounce.
+  const watchRepo = (repo: Repository) => {
+    log.info(`Watching repository: ${repo.rootUri.fsPath} (kind=${repo.kind})`);
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    context.subscriptions.push(
+      repo.state.onDidChange(() => {
+        if (debounceTimer) {
+          clearTimeout(debounceTimer);
+        }
+        debounceTimer = setTimeout(() => {
+          debounceTimer = undefined;
+          log.debug(`Repository state changed: ${repo.rootUri.fsPath}`);
+          applyBranchColor(repo);
+        }, 150);
+      })
+    );
+    applyBranchColor(repo);
+  };
+
+  // Handle repos that were already open before we activated.
+  for (const repo of state.gitApi.repositories) {
+    watchRepo(repo);
+  }
+
+  // Also handle repos that open after activation.
   context.subscriptions.push(
-    state.gitApi.onDidOpenRepository((repo) => {
-      context.subscriptions.push(
-        repo.state.onDidChange(() => applyBranchColor(repo))
-      );
-      applyBranchColor(repo);
-    })
+    state.gitApi.onDidOpenRepository((repo) => watchRepo(repo))
   );
 
   // Also watch for config changes so the user can live-edit the palette.
@@ -184,7 +212,9 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!repo || !e.affectsConfiguration("wtColor")) {
         return;
       }
+      log.info("wtColor configuration changed — reinitializing");
       state.initialized = false;
+      state.appliedBranch = undefined;
       applyBranchColor(repo);
     })
   );
@@ -192,11 +222,14 @@ export async function activate(context: vscode.ExtensionContext) {
   // Register command pallette commands
   context.subscriptions.push(
     vscode.commands.registerCommand("wt-color.refresh", () => {
+      log.info("Manual refresh triggered");
       const repo = state.gitApi?.repositories?.[0];
       if (!repo) {
+        log.warn("No repository found for refresh");
         return;
       }
       state.initialized = false;
+      state.appliedBranch = undefined;
       applyBranchColor(repo);
     })
   );
@@ -229,21 +262,36 @@ function applyBranchColor(repository: Repository) {
   );
 
   if (!repository || repository.kind !== "worktree" || !isOpenFolder) {
+    log.info(
+      `Skipping color — kind=${repository?.kind ?? "unknown"}, isOpenFolder=${isOpenFolder ?? false}`
+    );
     clearColors();
     return;
   }
 
   const branch = repository.state.HEAD?.name;
   if (!branch) {
+    log.info("No branch name on HEAD — clearing colors");
     clearColors();
+    return;
+  }
+
+  // Skip if we already applied colors for this branch.
+  if (branch === state.appliedBranch) {
+    log.debug(`Branch "${branch}" unchanged — skipping`);
     return;
   }
 
   const ix = pickIndex(branch);
   if (!state.colors[ix]) {
+    log.warn(`No color at index ${ix} for branch "${branch}" — clearing`);
     clearColors();
     return;
   }
+
+  log.info(
+    `Applying color index=${ix} for branch="${branch}" (${state.colors[ix]["titleBar.activeBackground"] ?? "n/a"})`
+  );
 
   const workbench = vscode.workspace.getConfiguration("workbench");
   const existing =
@@ -258,17 +306,24 @@ function applyBranchColor(repository: Repository) {
     { ...existing, ...state.colors[ix] },
     vscode.ConfigurationTarget.Workspace
   );
+  state.appliedBranch = branch;
 }
 
 function clearColors() {
+  log.debug("clearColors called");
+  state.appliedBranch = undefined;
   const workbench = vscode.workspace.getConfiguration("workbench");
   const existing =
     workbench.get<Record<string, string>>("colorCustomizations") ?? {};
   const updated = stripManagedKeys(existing);
   if (Object.keys(updated).length === Object.keys(existing).length) {
+    log.debug("No managed keys to clear");
     return;
   }
 
+  log.info(
+    `Clearing ${Object.keys(existing).length - Object.keys(updated).length} managed color keys`
+  );
   workbench.update(
     "colorCustomizations",
     Object.keys(updated).length > 0 ? updated : undefined,
@@ -285,6 +340,7 @@ function initializeColors() {
   state.initialized = true;
 
   if (!config.get<boolean>("enabled", true)) {
+    log.info("Extension disabled via wtColor.enabled — no colors loaded");
     state.colors = [];
     return;
   }
@@ -299,6 +355,10 @@ function initializeColors() {
     palette = DEFAULT_PALETTE;
   }
 
+  log.info(
+    `Initializing ${palette.length} colors for areas: [${areas.join(", ")}]`
+  );
+
   for (const bg of palette) {
     const fg = readableForeground(bg);
     const fgDim = adjustAlpha(fg, 0.6);
@@ -311,7 +371,7 @@ function initializeColors() {
 /**
  * Build a map of VS Code color keys from the selected areas and colors.
  */
-function buildColorMap(
+export function buildColorMap(
   areas: Area[],
   colors: {
     bg: string;
@@ -354,7 +414,7 @@ function resolveGitApi() {
 }
 
 /** Return a copy of `colors` with all extension-managed keys removed. */
-function stripManagedKeys(
+export function stripManagedKeys(
   colors: Record<string, string>
 ): Record<string, string> {
   const result: Record<string, string> = {};
@@ -371,7 +431,7 @@ function stripManagedKeys(
  * - "hash": djb2 hash of the branch name (deterministic per branch name).
  * - "index": the worktree's position in `git worktree list` (sequential rotation).
  */
-function pickIndex(branch: string): number {
+export function pickIndex(branch: string): number {
   let hash = 5381;
   for (let i = 0; i < branch.length; i++) {
     hash = (hash * 33) ^ branch.charCodeAt(i);
@@ -383,7 +443,7 @@ function pickIndex(branch: string): number {
 /**
  * Return white or black depending on which has better contrast with `hex`.
  */
-function readableForeground(hex: string): string {
+export function readableForeground(hex: string): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
@@ -396,7 +456,7 @@ function readableForeground(hex: string): string {
  * Lighten a hex color by mixing it toward white by `amount` (0-1).
  * Used to make borders and hover states visibly brighter than the base color.
  */
-function lighten(hex: string, amount: number): string {
+export function lighten(hex: string, amount: number): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
@@ -410,7 +470,7 @@ function lighten(hex: string, amount: number): string {
  * Produce an 8-digit hex color with the given alpha (0-1).
  * Used for the inactive title bar to make it subtly dimmer.
  */
-function adjustAlpha(hex: string, alpha: number): string {
+export function adjustAlpha(hex: string, alpha: number): string {
   const a = Math.round(alpha * 255)
     .toString(16)
     .padStart(2, "0");
