@@ -1,8 +1,8 @@
 {
   "name": "wt-color",
-  "displayName": "Worktree Color",
-  "description": "Deterministically colors the VS Code title bar based on the current git branch, making it easy to distinguish between worktree windows.",
-  "version": "0.1.0",
+  "displayName": "Git Worktree Color",
+  "description": "Color your VSCode Window in git worktrees based on the branch name.",
+  "version": "0.1.1",
   "publisher": "ghmeier",
   "engines": {
     "vscode": "^1.85.0"
