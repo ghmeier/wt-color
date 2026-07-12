@@ -266,7 +266,7 @@ function applyBranchColor(repository: Repository) {
     (f) => f.uri.fsPath === repository.rootUri.fsPath
   );
 
-  if (!repository || repository.kind !== "worktree" || !isOpenFolder) {
+  if (repository?.kind !== "worktree" || !isOpenFolder) {
     log.info(
       `Skipping color — kind=${repository?.kind ?? "unknown"}, isOpenFolder=${isOpenFolder ?? false}`
     );
