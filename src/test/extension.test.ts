@@ -1,10 +1,11 @@
 import * as assert from "assert";
 import {
-  pickIndex,
-  readableForeground,
-  lighten,
   adjustAlpha,
   buildColorMap,
+  contrastRatio,
+  lighten,
+  pickIndex,
+  readableForeground,
   stripManagedKeys,
 } from "../extension";
 
@@ -45,6 +46,23 @@ suite("readableForeground", () => {
   test("returns dark foreground for light backgrounds", () => {
     assert.strictEqual(readableForeground("#ffffff"), "#1a1a1a");
     assert.strictEqual(readableForeground("#f0f0f0"), "#1a1a1a");
+  });
+
+  test("picks dark text on lighter mid-tones the old threshold missed", () => {
+    // #d66633 sits just below the old luminance threshold, so it used to get
+    // light text at ~3.4:1 (fails WCAG AA). Dark text gives ~4.8:1.
+    assert.strictEqual(readableForeground("#d66633"), "#1a1a1a");
+  });
+
+  test("chooses the higher-contrast token", () => {
+    for (const bg of ["#c2a7f7", "#8f80f3", "#49c5b5", "#376204", "#61220d"]) {
+      const fg = readableForeground(bg);
+      const other = fg === "#1a1a1a" ? "#f8f8f2" : "#1a1a1a";
+      assert.ok(
+        contrastRatio(bg, fg) >= contrastRatio(bg, other),
+        `expected ${fg} to have the higher contrast against ${bg}`
+      );
+    }
   });
 });
 
@@ -102,6 +120,12 @@ suite("buildColorMap", () => {
     assert.strictEqual(result["titleBar.inactiveBackground"], "#2d1b3699");
     assert.strictEqual(result["titleBar.activeForeground"], "#f8f8f2");
     assert.strictEqual(result["titleBar.inactiveForeground"], "#f8f8f299");
+  });
+
+  test("colors the selected tab via the new tab.selectedBackground keys", () => {
+    const result = buildColorMap(["tab"], colors);
+    assert.strictEqual(result["tab.selectedBackground"], "#2d1b36");
+    assert.strictEqual(result["tab.selectedForeground"], "#f8f8f2");
   });
 
   test("maps multiple areas", () => {

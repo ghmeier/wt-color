@@ -104,6 +104,7 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
     bg: [
       "editorGroupHeader.tabsBackground",
       "tab.activeBackground",
+      "tab.selectedBackground",
       "tab.inactiveBackground",
       "tab.unfocusedActiveBackground",
       "tab.unfocusedInactiveBackground",
@@ -111,7 +112,11 @@ const AREA_KEYS: Record<Area, AreaMapping> = {
     ],
     bgBright: ["tab.hoverBackground", "tab.unfocusedHoverBackground"],
     bgDim: [],
-    fg: ["tab.activeForeground", "breadcrumb.foreground"],
+    fg: [
+      "tab.activeForeground",
+      "tab.selectedForeground",
+      "breadcrumb.foreground",
+    ],
     fgDim: [
       "tab.inactiveForeground",
       "tab.unfocusedActiveForeground",
@@ -440,16 +445,39 @@ export function pickIndex(branch: string): number {
   return Math.abs(hash) % state.colors.length;
 }
 
+const FG_DARK = "#1a1a1a";
+const FG_LIGHT = "#f8f8f2";
+
 /**
- * Return white or black depending on which has better contrast with `hex`.
+ * Return whichever foreground token (dark or light) has the higher WCAG
+ * contrast ratio against `hex`.
+ *
+ * Linearize the contrast ratio to relative luminance and compare the actual
+ * contrast ratios. Pick white or black depending on which has a higher contrast.
  */
 export function readableForeground(hex: string): string {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  // Relative luminance approximation.
-  const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-  return luminance > 140 ? "#1a1a1a" : "#f8f8f2";
+  return contrastRatio(hex, FG_DARK) >= contrastRatio(hex, FG_LIGHT)
+    ? FG_DARK
+    : FG_LIGHT;
+}
+
+/** WCAG relative luminance (0-1) of a 7-char sRGB hex color. */
+function relativeLuminance(hex: string): number {
+  const channel = (v: number) => {
+    const c = v / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const r = channel(parseInt(hex.slice(1, 3), 16));
+  const g = channel(parseInt(hex.slice(3, 5), 16));
+  const b = channel(parseInt(hex.slice(5, 7), 16));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** WCAG contrast ratio (1-21) between two 7-char hex colors. */
+export function contrastRatio(a: string, b: string): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
 }
 
 /**
