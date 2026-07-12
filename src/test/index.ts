@@ -1,6 +1,6 @@
-import * as path from "path";
-import * as Mocha from "mocha";
+import * as path from "node:path";
 import { glob } from "glob";
+import Mocha from "mocha";
 
 export async function run(): Promise<void> {
   const mocha = new Mocha({ ui: "tdd", color: true, timeout: 10000 });
