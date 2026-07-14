@@ -11,7 +11,7 @@ Deterministically colors your VS Code window based on the current git worktree's
 
 ```bash
 npm install && npm run compile && npm run package
-code-insiders --install-extension wt-color-0.2.0.vsix
+code-insiders --install-extension wt-color-0.2.1.vsix
 ```
 
 Or for development, symlink directly:

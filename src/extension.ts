@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { API, GitExtension, Repository } from "./git";
+import type { API, GitExtension, Repository, RepositoryKind } from "./git";
 
 let log: vscode.LogOutputChannel;
 
@@ -260,33 +260,84 @@ export async function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
+export type ColorAction =
+  | { type: "apply"; branch: string }
+  | { type: "clear" }
+  | { type: "skip" };
+
+/**
+ * Decide what a single repository's state change should do to the shared,
+ * window-wide color customizations. Pure so the strobing behavior can be
+ * tested without the VS Code runtime.
+ *
+ * The git extension tracks one `Repository` per worktree, submodule, and
+ * parent repo, and every one of them fires state-change events. Coloring is
+ * global, so only the repository backing the open workspace folder may drive
+ * it: a repo whose root is not an open folder returns "skip" rather than
+ * "clear". Without that, a submodule or parent repo would clear the colors the
+ * open worktree just applied on every git poll — the extension strobing on
+ * and off.
+ */
+export function decideColorAction(
+  repo: {
+    kind: RepositoryKind;
+    rootPath: string;
+    branch: string | undefined;
+  },
+  workspaceFolderPaths: string[],
+  appliedBranch: string | undefined
+): ColorAction {
+  const isOpenFolder = workspaceFolderPaths.includes(repo.rootPath);
+
+  // A repository that isn't the open workspace folder must not touch the
+  // shared color state, or it fights the open worktree's apply and strobes.
+  if (!isOpenFolder) {
+    return { type: "skip" };
+  }
+
+  if (repo.kind !== "worktree" || !repo.branch) {
+    return { type: "clear" };
+  }
+
+  // Colors for this branch are already applied — nothing to do.
+  if (repo.branch === appliedBranch) {
+    return { type: "skip" };
+  }
+
+  return { type: "apply", branch: repo.branch };
+}
+
 function applyBranchColor(repository: Repository) {
   initializeColors();
-  const isOpenFolder = vscode.workspace.workspaceFolders?.some(
-    (f) => f.uri.fsPath === repository.rootUri.fsPath
+
+  const workspaceFolderPaths =
+    vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+  const action = decideColorAction(
+    {
+      kind: repository.kind,
+      rootPath: repository.rootUri.fsPath,
+      branch: repository.state.HEAD?.name,
+    },
+    workspaceFolderPaths,
+    state.appliedBranch
   );
 
-  if (repository?.kind !== "worktree" || !isOpenFolder) {
+  if (action.type === "skip") {
+    log.debug(
+      `Skipping color for ${repository.rootUri.fsPath} (kind=${repository.kind})`
+    );
+    return;
+  }
+
+  if (action.type === "clear") {
     log.info(
-      `Skipping color — kind=${repository?.kind ?? "unknown"}, isOpenFolder=${isOpenFolder ?? false}`
+      `Clearing color — kind=${repository.kind}, branch=${repository.state.HEAD?.name ?? "none"}`
     );
     clearColors();
     return;
   }
 
-  const branch = repository.state.HEAD?.name;
-  if (!branch) {
-    log.info("No branch name on HEAD — clearing colors");
-    clearColors();
-    return;
-  }
-
-  // Skip if we already applied colors for this branch.
-  if (branch === state.appliedBranch) {
-    log.debug(`Branch "${branch}" unchanged — skipping`);
-    return;
-  }
-
+  const branch = action.branch;
   const ix = pickIndex(branch);
   if (!state.colors[ix]) {
     log.warn(`No color at index ${ix} for branch "${branch}" — clearing`);
@@ -301,10 +352,6 @@ function applyBranchColor(repository: Repository) {
   const workbench = vscode.workspace.getConfiguration("workbench");
   const existing =
     workbench.get<Record<string, string>>("colorCustomizations") ?? {};
-
-  // Merge other colors with extension-managed colors to apply them.
-  const updated = stripManagedKeys(existing);
-  Object.assign(updated, state.colors[ix]);
 
   workbench.update(
     "colorCustomizations",
