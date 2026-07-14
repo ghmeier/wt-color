@@ -3,6 +3,7 @@ import {
   adjustAlpha,
   buildColorMap,
   contrastRatio,
+  decideColorAction,
   lighten,
   pickIndex,
   readableForeground,
@@ -33,6 +34,83 @@ suite("pickIndex", () => {
   test("handles empty string without throwing", () => {
     const ix = pickIndex("");
     assert.strictEqual(typeof ix, "number");
+  });
+});
+
+suite("decideColorAction", () => {
+  const WORKTREE = "/repos/project/.worktrees/feature";
+  const folders = [WORKTREE];
+
+  test("applies color for the open worktree", () => {
+    const action = decideColorAction(
+      { kind: "worktree", rootPath: WORKTREE, branch: "feature/login" },
+      folders,
+      undefined
+    );
+    assert.deepStrictEqual(action, { type: "apply", branch: "feature/login" });
+  });
+
+  test("does not strobe when a second repo also fires state changes", () => {
+    // The open worktree plus a submodule inside it are both tracked by the git
+    // extension, and both fire onDidChange on every git poll. Coloring is
+    // window-wide, so only the worktree may drive it.
+    const submodule = {
+      kind: "submodule" as const,
+      rootPath: `${WORKTREE}/vendor/lib`,
+      branch: "main",
+    };
+
+    // 1. Worktree fires first and applies its color.
+    const applied = decideColorAction(
+      { kind: "worktree", rootPath: WORKTREE, branch: "feature/login" },
+      folders,
+      undefined
+    );
+    assert.deepStrictEqual(applied, { type: "apply", branch: "feature/login" });
+
+    // 2. The submodule fires next. Before the fix this returned { type: "clear" },
+    //    wiping the color just applied — the flip that makes the window strobe.
+    const afterSubmodule = decideColorAction(
+      submodule,
+      folders,
+      "feature/login"
+    );
+    assert.deepStrictEqual(afterSubmodule, { type: "skip" });
+
+    // 3. Worktree fires again; the color is already applied, so it stays put.
+    const stable = decideColorAction(
+      { kind: "worktree", rootPath: WORKTREE, branch: "feature/login" },
+      folders,
+      "feature/login"
+    );
+    assert.deepStrictEqual(stable, { type: "skip" });
+  });
+
+  test("clears when the open folder is not a worktree", () => {
+    const action = decideColorAction(
+      { kind: "repository", rootPath: WORKTREE, branch: "main" },
+      folders,
+      "feature/login"
+    );
+    assert.deepStrictEqual(action, { type: "clear" });
+  });
+
+  test("clears when the open worktree has no branch (detached HEAD)", () => {
+    const action = decideColorAction(
+      { kind: "worktree", rootPath: WORKTREE, branch: undefined },
+      folders,
+      "feature/login"
+    );
+    assert.deepStrictEqual(action, { type: "clear" });
+  });
+
+  test("skips repositories outside the open workspace folders", () => {
+    const action = decideColorAction(
+      { kind: "worktree", rootPath: "/some/other/worktree", branch: "other" },
+      folders,
+      undefined
+    );
+    assert.deepStrictEqual(action, { type: "skip" });
   });
 });
 
